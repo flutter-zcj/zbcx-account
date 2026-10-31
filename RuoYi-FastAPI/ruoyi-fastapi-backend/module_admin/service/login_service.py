@@ -1,0 +1,744 @@
+import asyncio
+import random
+import re
+import uuid
+from datetime import datetime, timedelta
+from typing import Any
+
+from fastapi import Depends, Form, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import Row
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from common.aspect.db_session import DBSessionDependency
+from common.constant import CommonConstant, MenuConstant
+from common.context import RequestContext
+from common.enums import PasswordCharacterType, RedisInitKeyConfig
+from common.vo import CrudResponseModel
+from config.env import AppConfig, JwtConfig, MailConfig
+from exceptions.exception import AuthException, LoginException, ServiceException
+from module_admin.dao.login_dao import get_user_by_email
+from module_admin.dao.user_dao import UserDao
+from module_admin.entity.do.dept_do import SysDept
+from module_admin.entity.do.menu_do import SysMenu
+from module_admin.entity.do.user_do import SysUser
+from module_admin.entity.vo.login_vo import (
+    EmailCodeModel,
+    MenuTreeModel,
+    MetaModel,
+    RouterModel,
+    SmsCode,
+    UserLogin,
+    UserRegister,
+)
+from module_admin.entity.vo.user_vo import AddUserModel, CurrentUserModel, ResetUserModel, TokenData, UserInfoModel
+from module_admin.service.user_service import UserService
+from module_identity.service.identity_service import (
+    CredentialAuthenticationError,
+    CredentialAuthenticationService,
+)
+from utils.client_ip_util import ClientIPUtil
+from utils.common_util import CamelCaseUtil
+from utils.jwt_util import JwtUtil
+from utils.log_util import logger
+from utils.mail_util import MailUtil
+from utils.message_util import message_service
+from utils.pwd_util import PwdUtil
+from utils.time_util import TimezoneUtil
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl='login')
+
+# 邮箱格式校验，长度上限与 sys_user.email 字段保持一致
+EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$')
+# 自动生成的登录账号只允许字母、数字、下划线与短横线
+USER_NAME_PATTERN = re.compile(r'^[A-Za-z0-9_-]{3,30}$')
+# 邮箱验证码业务场景
+EMAIL_SCENE_REGISTER = 'register'
+
+
+class CustomOAuth2PasswordRequestForm(OAuth2PasswordRequestForm):
+    """
+    自定义OAuth2PasswordRequestForm类，增加验证码及会话编号参数
+    """
+
+    def __init__(
+        self,
+        grant_type: str = Form(default=None, pattern='password'),
+        username: str = Form(),
+        password: str = Form(),
+        scope: str = Form(default=''),
+        client_id: str | None = Form(default=None),
+        client_secret: str | None = Form(default=None),
+        code: str | None = Form(default=''),
+        uuid: str | None = Form(default=''),
+        login_info: dict[str, str] | None = Form(default=None),
+    ) -> None:
+        super().__init__(
+            grant_type=grant_type,
+            username=username,
+            password=password,
+            scope=scope,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        self.code = code
+        self.uuid = uuid
+        self.login_info = login_info
+
+
+class LoginService:
+    """
+    登录模块服务层
+    """
+
+    @classmethod
+    async def authenticate_user(
+        cls, request: Request, query_db: AsyncSession, login_user: UserLogin
+    ) -> Row[tuple[SysUser, SysDept]]:
+        """
+        根据用户名密码校验用户登录
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param login_user: 登录用户对象
+        :return: 校验结果
+        """
+        referer = request.headers.get('referer')
+        request_from_docs = bool(referer and referer.endswith(('docs', 'redoc')))
+        try:
+            return await CredentialAuthenticationService.authenticate_legacy(
+                request.app.state.redis,
+                query_db,
+                login_user,
+                client_ip=ClientIPUtil.get_client_ip(request),
+                skip_captcha=request_from_docs and AppConfig.app_env == 'dev',
+            )
+        except CredentialAuthenticationError as exc:
+            logger.warning(exc.legacy_message)
+            raise LoginException(data='', message=exc.legacy_message) from exc
+
+    @classmethod
+    async def unlock_screen_services(
+        cls, query_db: AsyncSession, current_user: CurrentUserModel, password: str | None
+    ) -> bool:
+        """
+        校验当前登录用户的密码并解锁屏幕
+
+        :param query_db: orm对象
+        :param current_user: 当前登录用户
+        :param password: 用户密码
+        :return: 解锁结果
+        """
+        if not password:
+            raise ServiceException(message='密码不能为空')
+        user = await UserDao.get_user_by_name(query_db, current_user.user.user_name)
+        if not user:
+            raise ServiceException(message='服务器超时，请重新登录')
+        if not PwdUtil.verify_password(password, user.password):
+            raise ServiceException(message='密码错误，请重新输入')
+
+        return True
+
+    @classmethod
+    async def create_access_token(cls, data: dict, expires_delta: timedelta | None = None) -> str:
+        """
+        根据登录信息创建当前用户token
+
+        :param data: 登录信息
+        :param expires_delta: token有效期
+        :return: token
+        """
+        to_encode = data.copy()
+        expire = (
+            TimezoneUtil.utc_now() + expires_delta if expires_delta else TimezoneUtil.utc_now() + timedelta(minutes=30)
+        )
+        to_encode.update({'exp': expire})
+        return JwtUtil.encode(to_encode)
+
+    @classmethod
+    async def get_current_user(
+        cls,
+        request: Request = Request,
+        token: str = Depends(oauth2_scheme),
+        query_db: AsyncSession = DBSessionDependency(),
+    ) -> CurrentUserModel:
+        """
+        根据token获取当前用户信息
+
+        :param request: Request对象
+        :param token: 用户token
+        :param query_db: orm对象
+        :return: 当前用户信息对象
+        :raise: 令牌异常AuthException
+        """
+        # if token[:6] != 'Bearer':
+        #     logger.warning("用户token不合法")
+        #     raise AuthException(data="", message="用户token不合法")
+        try:
+            if token.startswith('Bearer '):
+                token = token.removeprefix('Bearer ').strip()
+            payload = JwtUtil.decode(token)
+            user_id: str = payload.get('user_id')
+            session_id: str = payload.get('session_id')
+            if not user_id:
+                logger.warning('用户token不合法')
+                raise AuthException(data='', message='用户token不合法')
+            token_data = TokenData(user_id=int(user_id))
+        except (TypeError, ValueError) as e:
+            logger.warning('用户token已失效，请重新登录')
+            raise AuthException(data='', message='用户token已失效，请重新登录') from e
+        query_user = await UserDao.get_user_by_id(query_db, user_id=token_data.user_id)
+        if query_user.get('user_basic_info') is None:
+            logger.warning('用户token不合法')
+            raise AuthException(data='', message='用户token不合法')
+        if AppConfig.app_same_time_login:
+            redis_token = await request.app.state.redis.get(f'{RedisInitKeyConfig.ACCESS_TOKEN.key}:{session_id}')
+        else:
+            # 此方法可实现同一账号同一时间只能登录一次
+            redis_token = await request.app.state.redis.get(
+                f'{RedisInitKeyConfig.ACCESS_TOKEN.key}:{query_user.get("user_basic_info").user_id}'
+            )
+        if token == redis_token:
+            if AppConfig.app_same_time_login:
+                await request.app.state.redis.set(
+                    f'{RedisInitKeyConfig.ACCESS_TOKEN.key}:{session_id}',
+                    redis_token,
+                    ex=timedelta(minutes=JwtConfig.jwt_redis_expire_minutes),
+                )
+            else:
+                await request.app.state.redis.set(
+                    f'{RedisInitKeyConfig.ACCESS_TOKEN.key}:{query_user.get("user_basic_info").user_id}',
+                    redis_token,
+                    ex=timedelta(minutes=JwtConfig.jwt_redis_expire_minutes),
+                )
+
+            role_id_list = [item.role_id for item in query_user.get('user_role_info')]
+            if 1 in role_id_list:  # noqa: SIM108
+                permissions = ['*:*:*']
+            else:
+                permissions = [row.perms for row in query_user.get('user_menu_info')]
+            post_ids = ','.join([str(row.post_id) for row in query_user.get('user_post_info')])
+            role_ids = ','.join([str(row.role_id) for row in query_user.get('user_role_info')])
+            roles = [row.role_key for row in query_user.get('user_role_info')]
+            is_default_modify_pwd = await cls.__init_password_is_modify(
+                request, query_user.get('user_basic_info').pwd_update_date
+            )
+            is_password_expired = await cls.__password_is_expired(
+                request, query_user.get('user_basic_info').pwd_update_date
+            )
+            pwd_chrtype = await cls.get_sys_account_chrtype(request)
+
+            current_user = CurrentUserModel(
+                permissions=permissions,
+                roles=roles,
+                appTimezone=AppConfig.app_timezone,
+                user=UserInfoModel(
+                    **CamelCaseUtil.transform_result(query_user.get('user_basic_info')),
+                    postIds=post_ids,
+                    roleIds=role_ids,
+                    dept=CamelCaseUtil.transform_result(query_user.get('user_dept_info')),
+                    role=CamelCaseUtil.transform_result(query_user.get('user_role_info')),
+                ),
+                pwdChrtype=pwd_chrtype,
+                isDefaultModifyPwd=is_default_modify_pwd,
+                isPasswordExpired=is_password_expired,
+            )
+            # 设置当前用户信息到上下文
+            RequestContext.set_current_user(current_user)
+            return current_user
+        logger.warning('用户token已失效，请重新登录')
+        raise AuthException(data='', message='用户token已失效，请重新登录')
+
+    @classmethod
+    async def get_sys_account_chrtype(cls, request: Request) -> str:
+        """
+        获取用户密码字符范围配置
+
+        :param request: Request对象
+        :return: 密码字符范围配置
+        """
+        pwd_chrtype = await request.app.state.redis.get(f'{RedisInitKeyConfig.SYS_CONFIG.key}:sys.account.chrtype')
+
+        return pwd_chrtype or '0'
+
+    @classmethod
+    async def __init_password_is_modify(cls, request: Request, pwd_update_date: datetime) -> bool:
+        """
+        判断当前用户是否初始密码登录
+
+        :param request: Request对象
+        :param pwd_update_date: 密码最后更新时间
+        :return: 是否初始密码登录
+        """
+        init_password_is_modify = await request.app.state.redis.get(
+            f'{RedisInitKeyConfig.SYS_CONFIG.key}:sys.account.initPasswordModify'
+        )
+        return init_password_is_modify == '1' and pwd_update_date is None
+
+    @classmethod
+    async def __password_is_expired(cls, request: Request, pwd_update_date: datetime) -> bool:
+        """
+        判断当前用户密码是否过期
+
+        :param request: Request对象
+        :param pwd_update_date: 密码最后更新时间
+        :return: 密码是否过期
+        """
+        password_validate_days = await request.app.state.redis.get(
+            f'{RedisInitKeyConfig.SYS_CONFIG.key}:sys.account.passwordValidateDays'
+        )
+        if password_validate_days and int(password_validate_days) > 0:
+            if pwd_update_date is None:
+                return True
+            expire_date = pwd_update_date + timedelta(days=int(password_validate_days))
+            if TimezoneUtil.utc_now() > expire_date:
+                return True
+        return False
+
+    @classmethod
+    async def get_current_user_routers(cls, user_id: int, query_db: AsyncSession) -> list[dict[str, Any]]:
+        """
+        根据用户id获取当前用户路由信息
+
+        :param user_id: 用户id
+        :param query_db: orm对象
+        :return: 当前用户路由信息对象
+        """
+        query_user = await UserDao.get_user_by_id(query_db, user_id=user_id)
+        user_router_menu = sorted(
+            [
+                row
+                for row in query_user.get('user_menu_info')
+                if row.menu_type in [MenuConstant.TYPE_DIR, MenuConstant.TYPE_MENU]
+            ],
+            key=lambda x: x.order_num,
+        )
+        menus = cls.__generate_menus(MenuConstant.ROOT_ID, user_router_menu)
+        user_router = cls.__generate_user_router_menu(menus)
+        return [router.model_dump(exclude_unset=True, by_alias=True) for router in user_router]
+
+    @classmethod
+    def __generate_menus(cls, pid: int, permission_list: list[SysMenu]) -> list[MenuTreeModel]:
+        """
+        工具方法：根据菜单信息生成菜单信息树形嵌套数据
+
+        :param pid: 菜单id
+        :param permission_list: 菜单列表信息
+        :return: 菜单信息树形嵌套数据
+        """
+        menu_list: list[MenuTreeModel] = []
+        for permission in permission_list:
+            if permission.parent_id == pid:
+                children = cls.__generate_menus(permission.menu_id, permission_list)
+                menu_list_data = MenuTreeModel(**CamelCaseUtil.transform_result(permission))
+                if children:
+                    menu_list_data.children = children
+                menu_list.append(menu_list_data)
+
+        return menu_list
+
+    @classmethod
+    def __generate_user_router_menu(cls, permission_list: list[MenuTreeModel]) -> list[RouterModel]:
+        """
+        工具方法：根据菜单树信息生成路由信息树形嵌套数据
+
+        :param permission_list: 菜单树列表信息
+        :return: 路由信息树形嵌套数据
+        """
+        router_list: list[RouterModel] = []
+        for permission in permission_list:
+            router = RouterModel(
+                hidden=permission.visible == '1',
+                name=RouterUtil.get_router_name(permission),
+                path=RouterUtil.get_router_path(permission),
+                component=RouterUtil.get_component(permission),
+                query=permission.query,
+                meta=MetaModel(
+                    title=permission.menu_name,
+                    icon=permission.icon,
+                    noCache=permission.is_cache == 1,
+                    link=permission.path if RouterUtil.is_http(permission.path) else None,
+                ),
+            )
+            c_menus = permission.children
+            if c_menus and permission.menu_type == MenuConstant.TYPE_DIR:
+                router.always_show = True
+                router.redirect = 'noRedirect'
+                router.children = cls.__generate_user_router_menu(c_menus)
+            elif RouterUtil.is_menu_frame(permission):
+                router.meta = None
+                children_list: list[RouterModel] = []
+                children = RouterModel(
+                    path=permission.path,
+                    component=permission.component,
+                    name=RouterUtil.get_route_name(permission.route_name, permission.path),
+                    meta=MetaModel(
+                        title=permission.menu_name,
+                        icon=permission.icon,
+                        noCache=permission.is_cache == 1,
+                        link=permission.path if RouterUtil.is_http(permission.path) else None,
+                    ),
+                    query=permission.query,
+                )
+                children_list.append(children)
+                router.children = children_list
+            elif permission.parent_id == MenuConstant.ROOT_ID and RouterUtil.is_inner_link(permission):
+                router.meta = MetaModel(title=permission.menu_name, icon=permission.icon)
+                router.path = '/'
+                children_list: list[RouterModel] = []
+                router_path = RouterUtil.inner_link_replace_each(permission.path)
+                children = RouterModel(
+                    path=router_path,
+                    component=MenuConstant.INNER_LINK,
+                    name=RouterUtil.get_route_name(permission.route_name, permission.path),
+                    meta=MetaModel(
+                        title=permission.menu_name,
+                        icon=permission.icon,
+                        link=permission.path if RouterUtil.is_http(permission.path) else None,
+                    ),
+                )
+                children_list.append(children)
+                router.children = children_list
+
+            router_list.append(router)
+
+        return router_list
+
+    @classmethod
+    async def send_email_code_services(
+        cls, request: Request, query_db: AsyncSession, email_code: EmailCodeModel
+    ) -> CrudResponseModel:
+        """
+        发送邮箱验证码services
+
+        验证码写入 Redis 并设置有效期，同时用独立的间隔键限制重复获取，
+        邮件投递在线程池中执行，避免阻塞事件循环
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param email_code: 邮箱验证码对象
+        :return: 发送结果
+        """
+        email = (email_code.email or '').strip().lower()
+        if not EMAIL_PATTERN.match(email) or len(email) > 50:
+            raise ServiceException(message='邮箱格式不正确')
+        if not MailUtil.is_enabled():
+            raise ServiceException(message='邮件服务未开启，请联系管理员')
+        scene = email_code.scene or EMAIL_SCENE_REGISTER
+        if scene == EMAIL_SCENE_REGISTER and await get_user_by_email(query_db, email):
+            raise ServiceException(message='该邮箱已注册，请直接登录')
+        redis = request.app.state.redis
+        resend_key = f'{RedisInitKeyConfig.EMAIL_CODE.key}:resend:{email}'
+        if await redis.get(resend_key):
+            raise ServiceException(message=f'验证码已发送，请{MailConfig.mail_code_resend_seconds}秒后再获取')
+        code_key = f'{RedisInitKeyConfig.EMAIL_CODE.key}:{email}'
+        code = ''.join(random.choices('0123456789', k=max(MailConfig.mail_code_length, 4)))
+        await redis.set(code_key, code, ex=timedelta(minutes=MailConfig.mail_code_ttl_minutes))
+        await redis.set(resend_key, '1', ex=timedelta(seconds=MailConfig.mail_code_resend_seconds))
+        try:
+            await asyncio.to_thread(MailUtil.send_email_code, email, code, scene)
+        except Exception:
+            await redis.delete(code_key, resend_key)
+            raise
+        logger.info(f'邮箱验证码已发送至{email}')
+
+        return CrudResponseModel(is_success=True, message='验证码已发送，请查收邮箱')
+
+    @classmethod
+    async def _build_register_user_name(cls, query_db: AsyncSession, user_name: str | None, email: str) -> str:
+        """
+        生成注册用户的登录账号
+
+        未填写账号时取邮箱前缀，前缀含非法字符时替换并截断；自动生成遇到
+        重名时追加随机数字，用户显式指定的账号重名则直接提示更换
+
+        :param query_db: orm对象
+        :param user_name: 用户填写的账号，可为空
+        :param email: 用户邮箱
+        :return: 可用的登录账号
+        """
+        filled = (user_name or '').strip()
+        candidate = filled or email.split('@')[0]
+        candidate = re.sub(r'[^A-Za-z0-9_-]', '_', candidate)[:24] or 'user'
+        if len(candidate) < 3:
+            candidate = f'{candidate}_user'
+        if not await UserDao.get_user_by_name(query_db, candidate):
+            return candidate
+        if filled:
+            raise ServiceException(message=f'登录账号{candidate}已存在，请更换后重试')
+        for _ in range(8):
+            alternative = f'{candidate[:25]}{random.randint(1000, 9999)}'
+            if not await UserDao.get_user_by_name(query_db, alternative):
+                return alternative
+        raise ServiceException(message='账号生成失败，请更换邮箱后重试')
+
+    @classmethod
+    async def register_user_services(
+        cls, request: Request, query_db: AsyncSession, user_register: UserRegister
+    ) -> CrudResponseModel:
+        """
+        用户注册services
+
+        注册必须提供邮箱并通过邮箱验证码校验，邮箱同时作为后续登录账号使用
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param user_register: 注册用户对象
+        :return: 注册结果
+        """
+        register_enabled = (
+            await request.app.state.redis.get(f'{RedisInitKeyConfig.SYS_CONFIG.key}:sys.account.registerUser') == 'true'
+        )
+        captcha_enabled = (
+            await request.app.state.redis.get(f'{RedisInitKeyConfig.SYS_CONFIG.key}:sys.account.captchaEnabled')
+            == 'true'
+        )
+        if user_register.password != user_register.confirm_password:
+            raise ServiceException(message='两次输入的密码不一致')
+        if not register_enabled:
+            raise ServiceException(message='注册程序已关闭，禁止注册')
+        email = (user_register.email or '').strip().lower()
+        if not email:
+            raise ServiceException(message='请填写邮箱')
+        if not EMAIL_PATTERN.match(email) or len(email) > 50:
+            raise ServiceException(message='邮箱格式不正确')
+        code_key = f'{RedisInitKeyConfig.EMAIL_CODE.key}:{email}'
+        cached_code = await request.app.state.redis.get(code_key)
+        if not cached_code:
+            raise ServiceException(message='邮箱验证码已失效，请重新获取')
+        if not user_register.email_code or user_register.email_code.strip() != str(cached_code):
+            raise ServiceException(message='邮箱验证码错误')
+        if captcha_enabled:
+            captcha_value = await request.app.state.redis.get(
+                f'{RedisInitKeyConfig.CAPTCHA_CODES.key}:{user_register.uuid}'
+            )
+            if not captcha_value:
+                raise ServiceException(message='验证码已失效')
+            if user_register.code != str(captcha_value):
+                raise ServiceException(message='验证码错误')
+        await UserService.validate_password_services(
+            request.app.state.redis, user_register.password, PasswordCharacterType.DEFAULT
+        )
+        if await get_user_by_email(query_db, email):
+            raise ServiceException(message='该邮箱已注册，请直接登录')
+        user_name = await cls._build_register_user_name(query_db, user_register.username, email)
+        add_user = AddUserModel(
+            userName=user_name,
+            nickName=user_name,
+            email=email,
+            password=PwdUtil.get_password_hash(user_register.password),
+            pwdUpdateDate=TimezoneUtil.utc_now(),
+        )
+        result = await UserService.add_user_services(query_db, add_user)
+        await request.app.state.redis.delete(code_key)
+
+        return result
+
+
+    @classmethod
+    async def get_sms_code_services(cls, request: Request, query_db: AsyncSession, user: ResetUserModel) -> SmsCode:
+        """
+        获取短信验证码service
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param user: 用户对象
+        :return: 短信验证码对象
+        """
+        redis_sms_result = await request.app.state.redis.get(f'{RedisInitKeyConfig.SMS_CODE.key}:{user.session_id}')
+        if redis_sms_result:
+            return SmsCode(is_success=False, sms_code='', session_id='', message='短信验证码仍在有效期内')
+        is_user = await UserDao.get_user_by_name(query_db, user.user_name)
+        if is_user:
+            sms_code = str(random.randint(100000, 999999))
+            session_id = str(uuid.uuid4())
+            await request.app.state.redis.set(
+                f'{RedisInitKeyConfig.SMS_CODE.key}:{session_id}', sms_code, ex=timedelta(minutes=2)
+            )
+            # 此处模拟调用短信服务
+            message_service(sms_code)
+
+            return SmsCode(is_success=True, sms_code=sms_code, session_id=session_id, message='获取成功')
+
+        return SmsCode(is_success=False, sms_code='', session_id='', message='用户不存在')
+
+    @classmethod
+    async def forget_user_services(
+        cls, request: Request, query_db: AsyncSession, forget_user: ResetUserModel
+    ) -> CrudResponseModel:
+        """
+        用户忘记密码services
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param forget_user: 重置用户对象
+        :return: 重置结果
+        """
+        redis_sms_result = await request.app.state.redis.get(
+            f'{RedisInitKeyConfig.SMS_CODE.key}:{forget_user.session_id}'
+        )
+        if forget_user.sms_code == redis_sms_result:
+            await UserService.validate_password_services(
+                request.app.state.redis, forget_user.password, PasswordCharacterType.DEFAULT
+            )
+            forget_user.password = PwdUtil.get_password_hash(forget_user.password)
+            forget_user.user_id = (await UserDao.get_user_by_name(query_db, forget_user.user_name)).user_id
+            edit_result = await UserService.reset_user_services(query_db, forget_user)
+            result = edit_result.dict()
+        elif not redis_sms_result:
+            result = {'is_success': False, 'message': '短信验证码已过期'}
+        else:
+            await request.app.state.redis.delete(f'{RedisInitKeyConfig.SMS_CODE.key}:{forget_user.session_id}')
+            result = {'is_success': False, 'message': '短信验证码不正确'}
+
+        return CrudResponseModel(**result)
+
+    @classmethod
+    async def logout_services(cls, request: Request, token_id: str) -> bool:
+        """
+        退出登录services
+
+        :param request: Request对象
+        :param token_id: 令牌编号
+        :return: 退出登录结果
+        """
+        await request.app.state.redis.delete(f'{RedisInitKeyConfig.ACCESS_TOKEN.key}:{token_id}')
+        # await request.app.state.redis.delete(f'{current_user.user.user_id}_access_token')
+        # await request.app.state.redis.delete(f'{current_user.user.user_id}_session_id')
+
+        return True
+
+
+class RouterUtil:
+    """
+    路由处理工具类
+    """
+
+    @classmethod
+    def get_router_name(cls, menu: MenuTreeModel) -> str:
+        """
+        获取路由名称
+
+        :param menu: 菜单数对象
+        :return: 路由名称
+        """
+        # 非外链并且是一级目录（类型为目录）
+        if cls.is_menu_frame(menu):
+            return ''
+
+        return cls.get_route_name(menu.route_name, menu.path)
+
+    @classmethod
+    def get_route_name(cls, name: str, path: str) -> str:
+        """
+        获取路由名称，如没有配置路由名称则取路由地址
+
+        :param name: 路由名称
+        :param path: 路由地址
+        :return: 路由名称（驼峰格式）
+        """
+        router_name = name if name else path
+        return router_name.capitalize()
+
+    @classmethod
+    def get_router_path(cls, menu: MenuTreeModel) -> str | None:
+        """
+        获取路由地址
+
+        :param menu: 菜单数对象
+        :return: 路由地址
+        """
+        # 内链打开外网方式
+        router_path = menu.path
+        if menu.parent_id != MenuConstant.ROOT_ID and cls.is_inner_link(menu):
+            router_path = cls.inner_link_replace_each(router_path)
+        # 非外链并且是一级目录（类型为目录）
+        if (
+            menu.parent_id == MenuConstant.ROOT_ID
+            and menu.menu_type == MenuConstant.TYPE_DIR
+            and menu.is_frame == MenuConstant.NO_FRAME
+        ):
+            router_path = f'/{menu.path}'
+        # 非外链并且是一级目录（类型为菜单）
+        elif cls.is_menu_frame(menu):
+            router_path = '/'
+        return router_path
+
+    @classmethod
+    def get_component(cls, menu: MenuTreeModel) -> str:
+        """
+        获取组件信息
+
+        :param menu: 菜单数对象
+        :return: 组件信息
+        """
+        component = MenuConstant.LAYOUT
+        if menu.component and not cls.is_menu_frame(menu):
+            component = menu.component
+        elif (
+            (menu.component is None or menu.component == '')
+            and menu.parent_id != MenuConstant.ROOT_ID
+            and cls.is_inner_link(menu)
+        ):
+            component = MenuConstant.INNER_LINK
+        elif (menu.component is None or menu.component == '') and cls.is_parent_view(menu):
+            component = MenuConstant.PARENT_VIEW
+        return component
+
+    @classmethod
+    def is_menu_frame(cls, menu: MenuTreeModel) -> bool:
+        """
+        判断是否为菜单内部跳转
+
+        :param menu: 菜单数对象
+        :return: 是否为菜单内部跳转
+        """
+        return (
+            menu.parent_id == MenuConstant.ROOT_ID
+            and menu.menu_type == MenuConstant.TYPE_MENU
+            and menu.is_frame == MenuConstant.NO_FRAME
+        )
+
+    @classmethod
+    def is_inner_link(cls, menu: MenuTreeModel) -> bool:
+        """
+        判断是否为内链组件
+
+        :param menu: 菜单数对象
+        :return: 是否为内链组件
+        """
+        return menu.is_frame == MenuConstant.NO_FRAME and cls.is_http(menu.path)
+
+    @classmethod
+    def is_parent_view(cls, menu: MenuTreeModel) -> bool:
+        """
+        判断是否为parent_view组件
+
+        :param menu: 菜单数对象
+        :return: 是否为parent_view组件
+        """
+        return menu.parent_id != MenuConstant.ROOT_ID and menu.menu_type == MenuConstant.TYPE_DIR
+
+    @classmethod
+    def is_http(cls, link: str) -> bool:
+        """
+        判断是否为http(s)://开头
+
+        :param link: 链接
+        :return: 是否为http(s)://开头
+        """
+        return link.startswith((CommonConstant.HTTP, CommonConstant.HTTPS))
+
+    @classmethod
+    def inner_link_replace_each(cls, path: str) -> str:
+        """
+        内链域名特殊字符替换
+
+        :param path: 内链域名
+        :return: 替换后的内链域名
+        """
+        old_values = [CommonConstant.HTTP, CommonConstant.HTTPS, CommonConstant.WWW, '.', ':']
+        new_values = ['', '', '', '/', '/']
+        for old, new in zip(old_values, new_values, strict=False):
+            path = path.replace(old, new)
+        return path

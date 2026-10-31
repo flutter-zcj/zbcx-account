@@ -1,0 +1,25 @@
+# 版本控制 / IDE
+.git
+.gitignore
+.idea
+.vscode
+*.iml
+
+# Python 虚拟环境与缓存
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.ruff_cache
+.pytest_cache
+
+# 构建产物
+build
+dist
+
+# 运行时本地产物
+logs
+dump.rdb
+*.log
+.DS_Store

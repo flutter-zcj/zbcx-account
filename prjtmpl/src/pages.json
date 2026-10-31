@@ -1,0 +1,107 @@
+{
+  "easycom": {
+    "autoscan": true,
+    "custom": {
+      "^u--(.*)": "uview-plus/components/u-$1/u-$1.vue",
+      "^up-(.*)": "uview-plus/components/u-$1/u-$1.vue",
+      "^u-([^-].*)": "uview-plus/components/u-$1/u-$1.vue",
+      "^lg-([^-].*)": "zhpub_ap/login/components/lg-$1/lg-$1.vue",
+      "^ol-([^-].*)": "zhpub_com/src/zpub_map/components/ol-$1/ol-$1.vue",
+      "^cx2-([^-].*)": "zhpub_com/src/zpub_att/components/cx2-$1/cx2-$1.vue",
+      "^(?!z-paging-refresh|z-paging-load-more)z-paging(.*)": "z-paging/components/z-paging$1/z-paging$1.vue",
+      "^uni-(.*)": "@dcloudio/uni-ui/lib/uni-$1/uni-$1.vue"
+    }
+  },
+  "pages": [
+    {
+      "name": "accountIndex",
+      "path": "pages/account/index",
+      "style": {
+        "navigationBarTitleText": "记账本",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "name": "accountAdd",
+      "path": "pages/account/add",
+      "style": {
+        "navigationBarTitleText": "记一笔",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "name": "accountAsset",
+      "path": "pages/account/account",
+      "style": {
+        "navigationBarTitleText": "资产管理"
+      }
+    },
+    {
+      "name": "accountCategory",
+      "path": "pages/account/category",
+      "style": {
+        "navigationBarTitleText": "分类管理"
+      }
+    },
+    {
+      "name": "accountBudget",
+      "path": "pages/account/budget",
+      "style": {
+        "navigationBarTitleText": "预算"
+      }
+    },
+    {
+      "name": "accountLedger",
+      "path": "pages/account/ledger",
+      "style": {
+        "navigationBarTitleText": "账本"
+      }
+    },
+    {
+      "name": "accountAi",
+      "path": "pages/account/ai",
+      "style": {
+        "navigationBarTitleText": "AI 记账"
+      }
+    },
+    {
+      "name": "accountRecurring",
+      "path": "pages/account/recurring",
+      "style": {
+        "navigationBarTitleText": "周期记账"
+      }
+    },
+    {
+      "name": "accountSearch",
+      "path": "pages/account/search",
+      "style": {
+        "navigationBarTitleText": "搜索账单"
+      }
+    },
+    {
+      "name": "register",
+      "path": "pages/register/register",
+      "style": {
+        "navigationBarTitleText": "注册",
+        "navigationStyle": "custom"
+      }
+    },
+    {
+      "name": "login",
+      "path": "pages/login/login",
+      "style": {
+        "navigationBarTitleText": "登录",
+        "navigationStyle": "custom"
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "记账本",
+    "navigationBarBackgroundColor": "#1AA86C",
+    "backgroundColor": "#F8F8F8",
+    "app-plus": {
+      "bounce": "none"
+    }
+  }
+}
